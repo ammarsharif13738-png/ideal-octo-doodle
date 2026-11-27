@@ -1,0 +1,182 @@
+name: Secure RDP - Ammar13738
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secure-rdp-setup
+  cancel-in-progress: false
+
+jobs:
+  secure-rdp:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+
+    steps:
+      - name: Validate Secrets
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Missing TAILSCALE_AUTH_KEY secret"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or
+              $env:RDP_PASSWORD.Length -lt 16) {
+            throw "RDP_PASSWORD must be at least 16 characters"
+          }
+
+      - name: Configure Secure RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          # Require Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
+          # Disable broad default RDP firewall rules
+          Get-NetFirewallRule -Name 'RemoteDesktop-UserMode-In-TCP',
+                                      'RemoteDesktop-UserMode-In-UDP' `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          # Allow RDP only from Tailscale IP range
+          Remove-NetFirewallRule -DisplayName "Ammar-Tailscale-RDP" `
+            -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "Ammar-Tailscale-RDP" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Start-Service TermService
+
+      - name: Create RDP Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "Ammar13738"
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser -Name $username -Password $securePassword
+            Enable-LocalUser -Name $username
+          }
+          else {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -Description "RDP account"
+          }
+
+          # Standard user: no administrator privileges
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP account configured successfully."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i "$installer" /quiet /norestart" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($process.ExitCode)"
+          }
+
+          Remove-Item $installer -Force
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $ts)) {
+            throw "Tailscale executable not found"
+          }
+
+          Start-Service Tailscale
+
+          & $ts up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=ammar13738-rdp" `
+            "--unattended"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
+
+          $ip = & $ts ip -4
+
+          if (!$ip) {
+            throw "No Tailscale IP assigned"
+          }
+
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "RDP Username: Ammar13738"
+
+      - name: Final Verification
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rdp = Get-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+
+          if ($rdp.fDenyTSConnections -ne 0) {
+            throw "RDP is not enabled"
+          }
+
+          $nla = Get-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+
+          if ($nla.UserAuthentication -ne 1) {
+            throw "NLA is not enabled"
+          }
+
+          if ((Get-Service TermService).Status -ne "Running") {
+            throw "RDP service is not running"
+          }
+
+          Write-Host "RDP configuration verified."
+          Write-Host "Username: Ammar13738"
+          Write-Host "RDP setup completed successfully."
